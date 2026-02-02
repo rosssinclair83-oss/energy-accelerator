@@ -69,13 +69,23 @@ Vercel is the industry standard for hosting React apps.
 ### 1. Push to GitHub
 Since you have already uploaded your large files to Cloudflare, we **do not** want to upload them to GitHub. The project has been configured (via `.gitignore`) to automatically skip these files.
 
-**If this is your first time saving to GitHub, run these commands in your terminal:**
+**Step A: Create the Repository on GitHub.com**
+1.  Log in to [GitHub.com](https://github.com/).
+2.  Click the **+** icon in the top right and select **New repository**.
+3.  Name it `energy-accelerator` (or similar).
+4.  Make it **Public** (easier) or **Private**.
+5.  **Do not** check "Add a README", ".gitignore", or "license" (we already have these).
+6.  Click **Create repository**.
+7.  Copy the HTTPS URL provided (it looks like `https://github.com/your-username/energy-accelerator.git`).
 
-1.  Initialize the repository:
+**Step B: Connect code from your computer**
+Type these commands in your VS Code terminal:
+
+1.  Initialize the repository (if you haven't already):
     ```powershell
     git init
     ```
-2.  Add all files (the `.gitignore` will ensure the large pmtiles are skipped):
+2.  Add all files:
     ```powershell
     git add .
     ```
@@ -83,12 +93,20 @@ Since you have already uploaded your large files to Cloudflare, we **do not** wa
     ```powershell
     git commit -m "Initial commit for deployment"
     ```
-4.  Connect to GitHub (replace `<YOUR_REPO_URL>` with your actual new repository URL from GitHub):
+4.  Connect to GitHub (Paste the URL you copied in Step A):
     ```powershell
     git branch -M main
-    git remote add origin <YOUR_REPO_URL>
+    git remote add origin https://github.com/YOUR-USERNAME/YOUR-REPO-NAME.git
+    ```
+5.  Push the code:
+    ```powershell
     git push -u origin main
     ```
+
+**Authentication (How to Log In)**
+When you run `git push`, a window should pop up asking you to sign in to GitHub.
+- **Browser**: Use the browser option to sign in securely.
+- **Token**: If it asks for a password, you need a "Personal Access Token", but the browser login is much easier.
 
 *Note: If `git status` shows `power.pmtiles`, do NOT commit yet. Check that `.gitignore` contains `*.pmtiles`.*
 
