@@ -1,0 +1,691 @@
+import { useEffect, useRef, useState } from 'react';
+import maplibregl, { AnySourceData, LayerSpecification } from 'maplibre-gl';
+import 'maplibre-gl/dist/maplibre-gl.css';
+import { PMTiles, Protocol } from 'pmtiles';
+
+import { cn } from '@/lib/utils';
+import { useAppStore } from '@/state/store';
+
+let mapInstance: maplibregl.Map | null = null;
+
+const protocol = (() => {
+  const globalScope = globalThis as typeof globalThis & { __pmtilesProtocol?: Protocol };
+
+  if (!globalScope.__pmtilesProtocol) {
+    const instance = new Protocol();
+    maplibregl.addProtocol('pmtiles', instance.tile.bind(instance));
+    globalScope.__pmtilesProtocol = instance;
+  }
+
+  return globalScope.__pmtilesProtocol;
+})();
+
+const POWER_SOURCE_ID = 'power';
+const BASEMAP_SOURCE_ID = 'basemap-light';
+const BASEMAP_LAYER_ID = 'basemap-light';
+
+const registerPmtilesArchive = (url: string) => {
+  const archive = new PMTiles(url);
+  protocol.add(archive);
+  return archive;
+};
+
+const ensureBasemap = (map: maplibregl.Map) => {
+  if (!map.getSource(BASEMAP_SOURCE_ID)) {
+    map.addSource(BASEMAP_SOURCE_ID, {
+      type: 'raster',
+      tiles: [
+        'https://a.basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png',
+        'https://b.basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png',
+        'https://c.basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png',
+        'https://d.basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png',
+      ],
+      tileSize: 256,
+      attribution:
+        '� <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors, � <a href="https://carto.com/attributions">CARTO</a>',
+    });
+  }
+
+  if (!map.getLayer(BASEMAP_LAYER_ID)) {
+    map.addLayer({
+      id: BASEMAP_LAYER_ID,
+      type: 'raster',
+      source: BASEMAP_SOURCE_ID,
+      minzoom: 0,
+      maxzoom: 19,
+    });
+  }
+};
+
+const isPlainObject = (value: unknown): value is Record<string, unknown> =>
+  typeof value === 'object' && value !== null && !Array.isArray(value);
+
+const extractVectorLayerIds = (metadata: unknown): Set<string> => {
+  const layerIds = new Set<string>();
+  if (!isPlainObject(metadata)) {
+    return layerIds;
+  }
+
+  const directLayers = metadata['vector_layers'];
+  if (Array.isArray(directLayers)) {
+    directLayers.forEach((layer) => {
+      if (isPlainObject(layer)) {
+        const id = layer['id'];
+        if (typeof id === 'string') {
+          layerIds.add(id);
+        }
+      }
+    });
+  }
+
+  const jsonValue = metadata['json'];
+  if (typeof jsonValue === 'string') {
+    try {
+      const parsed = JSON.parse(jsonValue);
+      if (isPlainObject(parsed) && Array.isArray(parsed['vector_layers'])) {
+        parsed['vector_layers'].forEach((layer) => {
+          if (isPlainObject(layer)) {
+            const id = layer['id'];
+            if (typeof id === 'string') {
+              layerIds.add(id);
+            }
+          }
+        });
+      }
+    } catch (error) {
+      console.warn('[MapView] unable to parse metadata.json', error);
+    }
+  }
+
+  return layerIds;
+};
+
+type Category =
+  | 'lines'
+  | 'minor_lines'
+  | 'cables'
+  | 'plants'
+  | 'generators'
+  | 'substations'
+  | 'towers'
+  | 'poles'
+  | 'switches'
+  | 'transformers'
+  | 'compensators'
+  | 'converters';
+
+interface LayerVariant {
+  geometry: 'line' | 'fill' | 'circle';
+  paint: LayerSpecification['paint'];
+  layout?: LayerSpecification['layout'];
+  minzoom?: number;
+  maxzoom?: number;
+  filter?: LayerSpecification['filter'];
+  idSuffix?: string;
+}
+
+interface CategoryStyle {
+  sourceLayer: string;
+  baseMinzoom?: number;
+  zIndex: number;
+  variants: LayerVariant[];
+}
+
+const circleStroke = '#ffffff';
+const VOLTAGE_EXPR = [
+  'to-number',
+  ['coalesce', ['get', 'voltage_kv'], ['get', 'voltage'], -1],
+] as const;
+
+const CATEGORY_STYLES: Record<Category, CategoryStyle> = {
+  lines: {
+    sourceLayer: 'lines',
+    baseMinzoom: 5,
+    zIndex: 30,
+    variants: [
+      {
+        idSuffix: '-400kv',
+        geometry: 'line',
+        minzoom: 5,
+        filter: ['>=', VOLTAGE_EXPR, 300],
+        paint: {
+          'line-color': '#ff002bff',
+          'line-width': ['interpolate', ['linear'], ['zoom'], 5, 1.6, 12, 5.2],
+          'line-opacity': 0.9,
+        },
+      },
+      {
+        idSuffix: '-132kv',
+        geometry: 'line',
+        minzoom: 7,
+        filter: ['all', ['>=', VOLTAGE_EXPR, 100], ['<', VOLTAGE_EXPR, 300]],
+        paint: {
+          'line-color': '#2f5f94',
+          'line-width': ['interpolate', ['linear'], ['zoom'], 5, 1.3, 12, 4.3],
+          'line-opacity': 0.82,
+        },
+      },
+      {
+        idSuffix: '-66kv',
+        geometry: 'line',
+        minzoom: 9,
+        filter: ['all', ['>=', VOLTAGE_EXPR, 50], ['<', VOLTAGE_EXPR, 100]],
+        paint: {
+          'line-color': '#3f79b8',
+          'line-width': ['interpolate', ['linear'], ['zoom'], 6, 1.1, 13, 3.2],
+          'line-opacity': 0.75,
+        },
+      },
+      {
+        idSuffix: '-33kv',
+        geometry: 'line',
+        minzoom: 11,
+        filter: ['all', ['>=', VOLTAGE_EXPR, 20], ['<', VOLTAGE_EXPR, 50]],
+        paint: {
+          'line-color': '#5a94ce',
+          'line-width': ['interpolate', ['linear'], ['zoom'], 6, 0.9, 13, 2.4],
+          'line-opacity': 0.7,
+        },
+      },
+      {
+        idSuffix: '-lv',
+        geometry: 'line',
+        minzoom: 13,
+        filter: ['all', ['>=', VOLTAGE_EXPR, 0], ['<', VOLTAGE_EXPR, 20]],
+        paint: {
+          'line-color': '#8ab1dc',
+          'line-width': ['interpolate', ['linear'], ['zoom'], 7, 0.8, 14, 1.8],
+          'line-opacity': 0.6,
+        },
+      },
+      {
+        idSuffix: '-other',
+        geometry: 'line',
+        minzoom: 13,
+        filter: ['==', VOLTAGE_EXPR, -1],
+        paint: {
+          'line-color': '#3a6ea5',
+          'line-width': ['interpolate', ['linear'], ['zoom'], 5, 1.2, 12, 3.5],
+          'line-opacity': 0.65,
+        },
+      },
+    ],
+  },
+  minor_lines: {
+    sourceLayer: 'minor_lines',
+    baseMinzoom: 13,
+    zIndex: 25,
+    variants: [
+      {
+        geometry: 'line',
+        paint: {
+          'line-color': '#6f8fad',
+          'line-width': ['interpolate', ['linear'], ['zoom'], 7, 0.8, 13, 2.5],
+          'line-opacity': 0.6,
+        },
+      },
+    ],
+  },
+  cables: {
+    sourceLayer: 'cables',
+    baseMinzoom: 7,
+    zIndex: 28,
+    variants: [
+      {
+        geometry: 'line',
+        paint: {
+          'line-color': '#4c75b8',
+          'line-width': ['interpolate', ['linear'], ['zoom'], 7, 0.6, 13, 2],
+          'line-dasharray': [1.2, 1.2],
+          'line-opacity': 0.7,
+        },
+      },
+    ],
+  },
+  plants: {
+    sourceLayer: 'plants',
+    baseMinzoom: 6,
+    zIndex: 20,
+    variants: [
+      {
+        idSuffix: '-solar-poly',
+        geometry: 'fill',
+        filter: [
+          'all',
+          ['any', ['==', ['geometry-type'], 'Polygon'], ['==', ['geometry-type'], 'MultiPolygon']],
+          ['==', ['downcase', ['coalesce', ['get', 'plant:source'], '']], 'solar'],
+        ],
+        paint: {
+          'fill-color': '#f9e4b7',
+          'fill-outline-color': '#e0b95f',
+          'fill-opacity': 0.7,
+        },
+      },
+      {
+        idSuffix: '-solar-pt',
+        geometry: 'circle',
+        filter: [
+          'all',
+          ['any', ['==', ['geometry-type'], 'Point'], ['==', ['geometry-type'], 'MultiPoint']],
+          ['==', ['downcase', ['coalesce', ['get', 'plant:source'], '']], 'solar'],
+        ],
+        paint: {
+          'circle-radius': ['interpolate', ['linear'], ['zoom'], 6, 2.6, 12, 5],
+          'circle-color': '#f2c76b',
+          'circle-stroke-color': circleStroke,
+          'circle-stroke-width': 1,
+        },
+      },
+      {
+        idSuffix: '-wind-poly',
+        geometry: 'fill',
+        filter: [
+          'all',
+          ['any', ['==', ['geometry-type'], 'Polygon'], ['==', ['geometry-type'], 'MultiPolygon']],
+          ['==', ['downcase', ['coalesce', ['get', 'plant:source'], '']], 'wind'],
+        ],
+        paint: {
+          'fill-color': '#d4e6f9',
+          'fill-outline-color': '#7aaed6',
+          'fill-opacity': 0.7,
+        },
+      },
+      {
+        idSuffix: '-wind-pt',
+        geometry: 'circle',
+        filter: [
+          'all',
+          ['any', ['==', ['geometry-type'], 'Point'], ['==', ['geometry-type'], 'MultiPoint']],
+          ['==', ['downcase', ['coalesce', ['get', 'plant:source'], '']], 'wind'],
+        ],
+        paint: {
+          'circle-radius': ['interpolate', ['linear'], ['zoom'], 6, 2.4, 12, 4.8],
+          'circle-color': '#7aaed6',
+          'circle-stroke-color': circleStroke,
+          'circle-stroke-width': 1,
+        },
+      },
+      {
+        idSuffix: '-other-poly',
+        geometry: 'fill',
+        filter: [
+          'all',
+          ['any', ['==', ['geometry-type'], 'Polygon'], ['==', ['geometry-type'], 'MultiPolygon']],
+          [
+            '!',
+            [
+              'in',
+              ['downcase', ['coalesce', ['get', 'plant:source'], '']],
+              ['literal', ['solar', 'wind']],
+            ],
+          ],
+        ],
+        paint: {
+          'fill-color': '#d9dfec',
+          'fill-outline-color': '#9aa6bf',
+          'fill-opacity': 0.55,
+        },
+      },
+      {
+        idSuffix: '-other-pt',
+        geometry: 'circle',
+        filter: [
+          'all',
+          ['any', ['==', ['geometry-type'], 'Point'], ['==', ['geometry-type'], 'MultiPoint']],
+          [
+            '!',
+            [
+              'in',
+              ['downcase', ['coalesce', ['get', 'plant:source'], '']],
+              ['literal', ['solar', 'wind']],
+            ],
+          ],
+        ],
+        paint: {
+          'circle-radius': ['interpolate', ['linear'], ['zoom'], 6, 2.2, 12, 4.2],
+          'circle-color': '#aebad1',
+          'circle-stroke-color': circleStroke,
+          'circle-stroke-width': 0.9,
+        },
+      },
+    ],
+  },
+  substations: {
+    sourceLayer: 'substations',
+    baseMinzoom: 6,
+    zIndex: 22,
+    variants: [
+      {
+        geometry: 'fill',
+        paint: {
+          'fill-color': '#a5abe6ff',
+          'fill-outline-color': '#d3b8cbff',
+          'fill-opacity': 0.7,
+        },
+      },
+    ],
+  },
+  generators: {
+    sourceLayer: 'generators',
+    baseMinzoom: 7,
+    zIndex: 40,
+    variants: [
+      {
+        idSuffix: '-poly',
+        geometry: 'fill',
+        filter: [
+          'any',
+          ['==', ['geometry-type'], 'Polygon'],
+          ['==', ['geometry-type'], 'MultiPolygon'],
+        ],
+        paint: {
+          'fill-color': '#fce1de',
+          'fill-outline-color': '#f25f5c',
+          'fill-opacity': 0.75,
+        },
+      },
+      {
+        idSuffix: '-pt',
+        geometry: 'circle',
+        filter: [
+          'any',
+          ['==', ['geometry-type'], 'Point'],
+          ['==', ['geometry-type'], 'MultiPoint'],
+        ],
+        paint: {
+          'circle-radius': ['interpolate', ['linear'], ['zoom'], 7, 3, 12, 6],
+          'circle-color': '#f25f5c',
+          'circle-stroke-color': circleStroke,
+          'circle-stroke-width': 1.2,
+        },
+      },
+    ],
+  },
+  converters: {
+    sourceLayer: 'converters',
+    baseMinzoom: 8,
+    zIndex: 38,
+    variants: [
+      {
+        geometry: 'circle',
+        paint: {
+          'circle-radius': ['interpolate', ['linear'], ['zoom'], 8, 2.4, 13, 5],
+          'circle-color': '#5a7ce2',
+          'circle-stroke-color': circleStroke,
+          'circle-stroke-width': 1,
+        },
+      },
+    ],
+  },
+  compensators: {
+    sourceLayer: 'compensators',
+    baseMinzoom: 10,
+    zIndex: 36,
+    variants: [
+      {
+        geometry: 'circle',
+        paint: {
+          'circle-radius': ['interpolate', ['linear'], ['zoom'], 10, 2, 14, 4.5],
+          'circle-color': '#79a8ff',
+          'circle-stroke-color': circleStroke,
+          'circle-stroke-width': 1,
+        },
+      },
+    ],
+  },
+  transformers: {
+    sourceLayer: 'transformers',
+    baseMinzoom: 10,
+    zIndex: 35,
+    variants: [
+      {
+        geometry: 'circle',
+        paint: {
+          'circle-radius': ['interpolate', ['linear'], ['zoom'], 10, 2, 14, 4.5],
+          'circle-color': '#f7a84f',
+          'circle-stroke-color': circleStroke,
+          'circle-stroke-width': 1,
+        },
+      },
+    ],
+  },
+  switches: {
+    sourceLayer: 'switches',
+    baseMinzoom: 11,
+    zIndex: 34,
+    variants: [
+      {
+        geometry: 'circle',
+        paint: {
+          'circle-radius': ['interpolate', ['linear'], ['zoom'], 11, 1.8, 15, 3.6],
+          'circle-color': '#9fb3c8',
+          'circle-stroke-color': circleStroke,
+          'circle-stroke-width': 0.8,
+        },
+      },
+    ],
+  },
+  towers: {
+    sourceLayer: 'towers',
+    baseMinzoom: 10,
+    zIndex: 32,
+    variants: [
+      {
+        geometry: 'circle',
+        paint: {
+          'circle-radius': ['interpolate', ['linear'], ['zoom'], 10, 1.8, 14, 3.2],
+          'circle-color': '#5d6d7e',
+          'circle-stroke-color': circleStroke,
+          'circle-stroke-width': 0.9,
+        },
+      },
+    ],
+  },
+  poles: {
+    sourceLayer: 'poles',
+    baseMinzoom: 7,
+    zIndex: 31,
+    variants: [
+      {
+        geometry: 'circle',
+        paint: {
+          'circle-radius': ['interpolate', ['linear'], ['zoom'], 12, 1.4, 16, 2.6],
+          'circle-color': '#a2b1c3',
+          'circle-stroke-color': circleStroke,
+          'circle-stroke-width': 0.7,
+        },
+      },
+    ],
+  },
+};
+
+export const getMap = () => mapInstance;
+
+export const ensureSourceExists = (map: maplibregl.Map, id: string, source: AnySourceData) => {
+  if (!map.getSource(id)) {
+    map.addSource(id, source);
+  }
+};
+
+const addPowerLayers = async (map: maplibregl.Map, archive: PMTiles) => {
+  const metadata = await archive.getMetadata().catch((error) => {
+    console.warn('[MapView] unable to fetch PMTiles metadata', error);
+    return null;
+  });
+
+  const availableLayers = extractVectorLayerIds(metadata);
+
+  const layerResults: Array<{ category: Category; status: 'added' | 'skipped' }> = [];
+
+  Object.entries(CATEGORY_STYLES)
+    .sort(([, a], [, b]) => a.zIndex - b.zIndex)
+    .forEach(([category, style]) => {
+      const typedCategory = category as Category;
+      if (availableLayers.size && !availableLayers.has(style.sourceLayer)) {
+        layerResults.push({ category: typedCategory, status: 'skipped' });
+        return;
+      }
+
+      let addedVariant = false;
+
+      style.variants.forEach((variant) => {
+        const layerId = `pwr-${typedCategory}${variant.idSuffix ?? ''}`;
+        if (map.getLayer(layerId)) {
+          addedVariant = true;
+          return;
+        }
+
+        const layer: LayerSpecification = {
+          id: layerId,
+          source: POWER_SOURCE_ID,
+          'source-layer': style.sourceLayer,
+          type: variant.geometry,
+          paint: variant.paint,
+          minzoom: variant.minzoom ?? style.baseMinzoom ?? 0,
+        };
+
+        if (typeof variant.maxzoom === 'number') {
+          layer.maxzoom = variant.maxzoom;
+        }
+
+        if (variant.layout) {
+          layer.layout = variant.layout;
+        }
+
+        if (variant.filter) {
+          layer.filter = variant.filter;
+        }
+
+        map.addLayer(layer);
+        addedVariant = true;
+      });
+
+      layerResults.push({ category: typedCategory, status: addedVariant ? 'added' : 'skipped' });
+    });
+
+  const added = layerResults
+    .filter((entry) => entry.status === 'added')
+    .map((entry) => entry.category);
+  const skipped = layerResults
+    .filter((entry) => entry.status === 'skipped')
+    .map((entry) => entry.category);
+
+  console.info('[MapView] power layer summary', {
+    added,
+    skipped,
+  });
+};
+
+interface MapViewProps {
+  className?: string;
+}
+
+const MapView = ({ className }: MapViewProps) => {
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  const mapRef = useRef<maplibregl.Map | null>(null);
+  const resizeObserverRef = useRef<ResizeObserver | null>(null);
+  const initialViewRef = useRef<{ center: [number, number]; zoom: number } | null>(null);
+  const setView = useAppStore((state) => state.setView);
+  const [zoomLevel, setZoomLevel] = useState<number | null>(null);
+
+  if (!initialViewRef.current) {
+    const { center, zoom } = useAppStore.getState();
+    initialViewRef.current = {
+      center: [...center] as [number, number],
+      zoom,
+    };
+  }
+
+  useEffect(() => {
+    if (!containerRef.current || !initialViewRef.current) {
+      return undefined;
+    }
+
+    const pmtilesUrl = `${window.location.origin}/power.pmtiles`;
+    const archive = registerPmtilesArchive(pmtilesUrl);
+
+    const map = new maplibregl.Map({
+      container: containerRef.current,
+      center: initialViewRef.current.center,
+      zoom: initialViewRef.current.zoom,
+      minZoom: 2,
+      maxPitch: 0,
+      style: {
+        version: 8,
+        name: 'Energy Accelerator Light',
+        glyphs: 'https://demotiles.maplibre.org/font/{fontstack}/{range}.pbf',
+        sources: {},
+        layers: [
+          {
+            id: 'background',
+            type: 'background',
+            paint: { 'background-color': '#f7f5ef' },
+          },
+        ],
+      },
+    });
+
+    setZoomLevel(Number(map.getZoom().toFixed(2)));
+
+    mapRef.current = map;
+    mapInstance = map;
+
+    resizeObserverRef.current = new ResizeObserver(() => map.resize());
+    resizeObserverRef.current.observe(containerRef.current);
+
+    const handleMoveEnd = () => {
+      const currentCenter = map.getCenter();
+      const currentZoom = map.getZoom();
+      setView([currentCenter.lng, currentCenter.lat], currentZoom);
+      setZoomLevel(Number(currentZoom.toFixed(2)));
+    };
+
+    map.on('moveend', handleMoveEnd);
+
+    map.on('load', async () => {
+      ensureBasemap(map);
+      setZoomLevel(Number(map.getZoom().toFixed(2)));
+
+      ensureSourceExists(map, POWER_SOURCE_ID, {
+        type: 'vector',
+        url: `pmtiles://${pmtilesUrl}`,
+      });
+
+      console.info('[MapView] power source ready', map.getSource(POWER_SOURCE_ID));
+
+      await addPowerLayers(map, archive);
+    });
+
+    map.on('error', (event) => {
+      if (event?.error) {
+        console.error('[MapView] map error', event.error);
+      }
+    });
+
+    return () => {
+      map.off('moveend', handleMoveEnd);
+      map.remove();
+      mapRef.current = null;
+      mapInstance = null;
+
+      if (resizeObserverRef.current) {
+        resizeObserverRef.current.disconnect();
+        resizeObserverRef.current = null;
+      }
+    };
+  }, [setView]);
+
+  return (
+    <div ref={containerRef} className={cn('relative h-full w-full', className)}>
+      {zoomLevel !== null && (
+        <div className="pointer-events-none absolute right-3 top-3 rounded-md bg-card/80 px-3 py-1 text-xs font-medium text-muted-foreground shadow-sm ring-1 ring-border/50">
+          Zoom: {zoomLevel.toFixed(2)}
+        </div>
+      )}
+    </div>
+  );
+};
+
+export default MapView;
+
+
