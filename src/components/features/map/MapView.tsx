@@ -1713,7 +1713,8 @@ const MapView = ({ className }: MapViewProps) => {
       return undefined;
     }
 
-    const baseUrl = import.meta.env.VITE_DATA_BASE_URL || window.location.origin;
+    const envBaseUrl = import.meta.env.VITE_DATA_BASE_URL || window.location.origin;
+    const baseUrl = envBaseUrl.endsWith('/') ? envBaseUrl.slice(0, -1) : envBaseUrl;
     const pmtilesUrl = `${baseUrl}/power.pmtiles`;
     const archive = registerPmtilesArchive(pmtilesUrl);
     const labelPmtilesUrl = `${baseUrl}/powerlabels.pmtiles`;

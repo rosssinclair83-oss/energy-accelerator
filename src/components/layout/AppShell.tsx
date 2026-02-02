@@ -105,7 +105,8 @@ const AppShell = () => {
   // Load Search Index
   useEffect(() => {
     setIsSearchLoading(true);
-    const baseUrl = import.meta.env.VITE_DATA_BASE_URL || '';
+    const envBaseUrl = import.meta.env.VITE_DATA_BASE_URL || '';
+    const baseUrl = envBaseUrl.endsWith('/') ? envBaseUrl.slice(0, -1) : envBaseUrl;
     fetch(`${baseUrl}/power_search_index.json`)
       .then(res => res.json())
       .then(data => {
